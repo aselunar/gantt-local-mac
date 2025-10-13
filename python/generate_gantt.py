@@ -123,7 +123,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
     # --- Render chart: daily axis with labels on top ---
     range_days = (max_date - min_date).days + 1
-    fig_w = max(24, min(48, range_days/3.0))   # conservative width
+    fig_w = max(24, range_days/3.0) # ~1/3 inch per day (~36 px/day at 110 DPI), no upper cap
     fig_h = max(4.5, 0.46*len(order) + 2.0)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
