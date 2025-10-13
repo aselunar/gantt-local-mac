@@ -9,6 +9,12 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font
 
+try:
+    from PIL import Image as PILImage
+    PILImage.MAX_IMAGE_PIXELS = 300_000_000  # or None to disable the limit
+except Exception:
+    pass
+
 def run_gantt(in_path: str, out_path: str, chart_png: str):
     # --- Read FIRST sheet as the authoritative input (do not modify it) ---
     xl = pd.ExcelFile(in_path)
