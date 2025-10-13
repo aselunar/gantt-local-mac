@@ -127,34 +127,90 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     order = list(order_df[['gid','gtitle']].itertuples(index=False, name=None))
     ypos = {gid:i for i,(gid,_) in enumerate(order)}
 
-    # --- Render chart: daily axis with labels on top ---
+        # --- Render chart: daily axis with above-the-bar captions & leader lines ---
     range_days = (max_date - min_date).days + 1
-    fig_w = max(24, range_days/3.0) # ~1/3 inch per day (~36 px/day at 110 DPI), no upper cap
-    fig_h = max(4.5, 0.46*len(order) + 2.0)
+
+    # Assign a "label level" per child so captions stack above the bar when time spans overlap
+    BAR_H = 0.68
+    LABEL_GAP = 0.18       # gap from top of bar to first caption line
+    LEVEL_STEP = 0.36      # vertical distance between caption lines
+    TOP_PAD = 0.08         # padding above the highest caption line
+    BOTTOM_GAP = 0.35      # gap below bar before next parent row
+
+    seg_df['label_level'] = 0
+    max_level_by_gid = {}
+
+    for (gid, gtitle), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
+        # Greedy interval stacking: smallest number of vertical levels so overlapping bars get separate lines
+        levels_right = []  # rightmost x (date2num) occupied per level
+        for idx, s in grp.sort_values('sdt').iterrows():
+            left = mdates.date2num(s['sdt'])
+            w = (s['edt'] - s['sdt']).days + 1
+            right = left + w
+            assigned = None
+            for l, rgt in enumerate(levels_right):
+                if left >= rgt:  # no overlap with that level
+                    assigned = l
+                    levels_right[l] = right
+                    break
+            if assigned is None:
+                levels_right.append(right)
+                assigned = len(levels_right) - 1
+            seg_df.at[idx, 'label_level'] = assigned
+        max_level_by_gid[gid] = len(levels_right) if levels_right else 1
+
+    # Compute per-parent Y centers with extra headroom for stacked captions
+    order_df = seg_df.groupby(['gid','gtitle'])['sdt'].min().reset_index().sort_values('sdt')
+    order = list(order_df[['gid','gtitle']].itertuples(index=False, name=None))
+
+    y_center = {}
+    tick_ys = []
+    tick_labels = []
+    y_cursor = 0.0
+    for gid, gtitle in order:
+        L = max_level_by_gid.get(gid, 1)
+        top_extra = LABEL_GAP + L * LEVEL_STEP + TOP_PAD
+        y0 = y_cursor + top_extra + (BAR_H / 2.0)
+        y_center[gid] = y0
+        tick_ys.append(y0)
+        tick_labels.append(gtitle)
+        # Move cursor to start of next parent row space
+        y_cursor = y0 + (BAR_H / 2.0) + BOTTOM_GAP
+
+    # Stretch width so dates remain readable (you already raised MAX_IMAGE_PIXELS; this can get large)
+    fig_w = max(24, range_days / 3.0)
+    # Height proportional to total stacked space used
+    fig_h = max(4.5, 0.46 * y_cursor + 1.0)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     colors = {}
     for (gid, gtitle), grp in seg_df.groupby(['gid','gtitle'], sort=False):
-        y0 = ypos[gid]
+        y0 = y_center[gid]
         col = colors.setdefault(gid, plt.cm.tab20((len(colors)%20)/20))
-        offsets = [0.0]
-        for k in range(1,6): offsets.extend([-0.22*k, 0.22*k])
-        it = iter(offsets)
         for _, s in grp.sort_values('sdt').iterrows():
-            x0 = mdates.date2num(s['sdt']); w = (s['edt'] - s['sdt']).days + 1
-            ax.broken_barh([(x0, w)], (y0-0.34, 0.68), facecolors=col, edgecolors='black', linewidth=0.6)
-            try: dy = next(it)
-            except StopIteration: dy = 0.0
+            # Bar
+            x0 = mdates.date2num(s['sdt'])
+            w = (s['edt'] - s['sdt']).days + 1
+            ax.broken_barh([(x0, w)], (y0 - BAR_H/2.0, BAR_H),
+                           facecolors=col, edgecolors='black', linewidth=0.6, zorder=2)
+            # Caption above bar
             xc = mdates.date2num(s['sdt'] + timedelta(days=w/2.0))
-            yl = y0 - 0.50 + dy
-            ax.text(xc, yl, s['ctitle'], ha='center', va='bottom', fontsize=8.2, color='black')
+            lvl = int(s['label_level'])
+            y_label = y0 - (BAR_H/2.0) - LABEL_GAP - lvl * LEVEL_STEP
+            ax.text(xc, y_label, s['ctitle'],
+                    ha='center', va='bottom', fontsize=8.2, color='black', zorder=5, clip_on=False)
+            # Leader line from caption down to bar top
+            ax.plot([xc, xc], [y0 - BAR_H/2.0, y_label],
+                    color=col, linewidth=0.8, alpha=0.9, zorder=4)
 
-    ax.set_yticks(range(len(order)))
-    ax.set_yticklabels([gt for (_, gt) in order])
-    ax.invert_yaxis()
+    # Y axis: ticks at each parent center
+    ax.set_yticks(tick_ys)
+    ax.set_yticklabels(tick_labels)
+    ax.set_ylim(-0.3, y_cursor + 0.3)
+    ax.invert_yaxis()  # earliest parent at the top
 
-    # Daily axis (every date visible)
+    # X axis: daily labels (you can keep your previous adaptive logic if desired)
     ax.set_xlim(mdates.date2num(min_date - timedelta(days=1)), mdates.date2num(max_date + timedelta(days=1)))
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %Y'))
@@ -162,7 +218,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
         t.set_rotation(90); t.set_fontsize(7)
 
     ax.set_xlabel('Date (daily)')
-    ax.set_title('Parent (single row) Gantt — Daily Axis, Top Labels (Earliest at Top)')
+    ax.set_title('Parent (single row) Gantt — Captions Above with Leader Lines (Earliest at Top)')
     ax.grid(axis='x', linestyle=':', alpha=0.35)
 
     plt.tight_layout()
