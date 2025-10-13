@@ -17,3 +17,5 @@ gantt-local-mac.zip
 # Logs / temp
 *.log
 IGNORE
+
+.history
