@@ -7,7 +7,6 @@
 # Python
 .venv/
 __pycache__/
-*/__pychace__/
 *.pyc
 
 # Generated artifacts
