@@ -1,5 +1,6 @@
 import matplotlib
-matplotlib.use("Agg")  # headless PNG rendering on macOS
+matplotlib.use("Agg")  # headless PNG rendering on macOS / servers
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -11,9 +12,10 @@ from openpyxl.styles import Font
 
 try:
     from PIL import Image as PILImage
-    PILImage.MAX_IMAGE_PIXELS = None  # or None to disable the limit
+    PILImage.MAX_IMAGE_PIXELS = None  # disable limit for large charts
 except Exception:
     pass
+
 
 def run_gantt(in_path: str, out_path: str, chart_png: str):
     # --- Read FIRST sheet as the authoritative input (do not modify it) ---
@@ -31,50 +33,60 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     if header_idx is None:
         raise RuntimeError("Couldn't locate header row with 'ID' and 'Title' on the first sheet")
 
-    headers = [h if isinstance(h,str) and h.strip()!='nan' else f'col_{j}' for j,h in enumerate(df_raw.iloc[header_idx].tolist())]
-    df = df_raw.iloc[header_idx+1:].copy(); df.columns = headers
+    headers = [h if isinstance(h, str) and h.strip() != 'nan' else f'col_{j}'
+               for j, h in enumerate(df_raw.iloc[header_idx].tolist())]
+    df = df_raw.iloc[header_idx + 1:].copy()
+    df.columns = headers
 
-    # Ensure expected columns
-    needed = ['ID','Parent','Title','SP','Story Points','ChartStart_Recon_Date','ChartStart','ChartEnd','FinalStart','FinalEnd','Start','End','GanttStart']
+    # Ensure expected columns exist
+    needed = [
+        'ID', 'Parent', 'Title', 'SP', 'Story Points', 'ChartStart_Recon_Date',
+        'ChartStart', 'ChartEnd', 'FinalStart', 'FinalEnd', 'Start', 'End', 'GanttStart',
+        'State', 'IsParent'
+    ]
     for c in needed:
         if c not in df.columns:
             df[c] = np.nan
 
     # Numeric coercion
-    for c in ['ID','Parent','SP','Story Points','GanttStart']:
+    for c in ['ID', 'Parent', 'SP', 'Story Points', 'GanttStart']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    excel_origin = datetime(1899,12,30)
+    excel_origin = datetime(1899, 12, 30)
 
     def to_date(v):
-        if v is None: return None
-        if isinstance(v,(datetime,pd.Timestamp)):
+        if v is None:
+            return None
+        if isinstance(v, (datetime, pd.Timestamp)):
             try:
                 return pd.to_datetime(v).to_pydatetime()
             except Exception:
                 pass
         s = str(v).strip()
-        if s=='' or s.lower() in ('nan','none'): return None
+        if s == '' or s.lower() in ('nan', 'none'):
+            return None
+        # Excel serial?
         try:
             f = float(s)
             if f > 20000:
                 return excel_origin + timedelta(days=int(f))
         except Exception:
             pass
-        if (' ' in s) and s.split(' ')[0].count('-')==2:
+        # Try typical date strings (trim trailing time)
+        if (' ' in s) and s.split(' ')[0].count('-') == 2:
             s = s.split(' ')[0]
         dt = pd.to_datetime(s, errors='coerce', dayfirst=False)
         return None if pd.isna(dt) else dt.to_pydatetime()
 
     # Choose SP column
-    sp_col = 'SP' if 'SP' in df.columns and df['SP'].notna().any() else ('Story Points' if 'Story Points' in df.columns and df['Story Points'].notna().any() else None)
+    sp_col = 'SP' if df['SP'].notna().any() else ('Story Points' if df['Story Points'].notna().any() else None)
     if sp_col is None:
         df['__SP__'] = np.nan
         sp_col = '__SP__'
 
-    start_pri = ['ChartStart_Recon_Date','ChartStart','FinalStart','Start','GanttStart']
-    end_pri = ['ChartEnd','FinalEnd','End']
+    start_pri = ['ChartStart_Recon_Date', 'ChartStart', 'FinalStart', 'Start', 'GanttStart']
+    end_pri = ['ChartEnd', 'FinalEnd', 'End']
 
     def pick_start(row):
         for c in start_pri:
@@ -90,61 +102,119 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
                 d = to_date(row[c])
                 if d is not None:
                     return d
+        # Fallback to SP duration if we have a start
         if sdt is not None:
             sp = pd.to_numeric(row.get(sp_col, np.nan), errors='coerce')
             if pd.notna(sp) and sp > 0:
-                return sdt + timedelta(days=int(round(sp))-1)
+                return sdt + timedelta(days=int(round(sp)) - 1)
         return None
 
-    # Map ID->Title for parent titles
+    # --- Build helper maps from the full table (before filtering) ---
+    # Map ID->Title for parent group labels
     id_title = {}
     for _, r in df.iterrows():
         rid = pd.to_numeric(r.get('ID'), errors='coerce')
         if pd.notna(rid) and pd.notna(r.get('Title')):
             id_title[int(rid)] = str(r['Title'])
 
-    # Build segments
+    # Map ID->State for parent closed-state filtering
+    id_state = {}
+    for _, r in df.iterrows():
+        rid = pd.to_numeric(r.get('ID'), errors='coerce')
+        if pd.notna(rid):
+            id_state[int(rid)] = str(r.get('State') or '').strip()
+
+    # Identify parent IDs (from being referenced as a Parent) and also optionally via IsParent flag
+    parent_ids = set(pd.to_numeric(df.get('Parent'), errors='coerce').dropna().astype(int).tolist())
+    has_is_parent = 'IsParent' in df.columns
+
+    def is_parent_row(row) -> bool:
+        """True if the row is a logical parent row (Epic/Feature/etc.)."""
+        rid = pd.to_numeric(row.get('ID'), errors='coerce')
+        if pd.isna(rid):
+            return False
+        rid = int(rid)
+        if has_is_parent:
+            v = str(row.get('IsParent')).strip().lower()
+            if v in ('1', 'true', 'yes'):
+                return True
+        return rid in parent_ids
+
+    # Which states should be treated as "closed/done" for parent filtering?
+    CLOSED_STATES = {'Closed', 'Done', 'Removed', 'Resolved'}  # adjust to your process template
+
+    # --- Build segments (children bars only; skip pure parent bars) ---
     rows = []
     for _, row in df.iterrows():
-        sdt = pick_start(row); edt = pick_end(row, sdt)
-        if sdt is None or edt is None: continue
+        sdt = pick_start(row)
+        edt = pick_end(row, sdt)
+        if sdt is None or edt is None:
+            continue
+
+        # Clamp out-of-order dates to prevent negative durations
+        if edt < sdt:
+            edt = sdt
+
         cid = pd.to_numeric(row.get('ID'), errors='coerce')
-        ctitle = str(row.get('Title')) if pd.notna(row.get('Title')) else (f'ID {int(cid)}' if pd.notna(cid) else '(untitled)')
+        ctitle = (str(row.get('Title')) if pd.notna(row.get('Title'))
+                  else (f'ID {int(cid)}' if pd.notna(cid) else '(untitled)'))
+
         parent = pd.to_numeric(row.get('Parent'), errors='coerce') if 'Parent' in row else np.nan
+
+        # Skip drawing a bar for pure parent rows (they'll serve as grouping headers via their children)
+        if pd.isna(parent) and is_parent_row(row):
+            continue
+
+        # If the row has a parent, enforce "parent not closed" filter
         if pd.notna(parent):
-            gid = int(parent); gtitle = id_title.get(gid, f'ID {gid}'); orphan=False
+            p_state = id_state.get(int(parent), '')
+            if p_state in CLOSED_STATES:
+                continue  # skip child whose parent is closed
+
+            gid = int(parent)
+            gtitle = id_title.get(gid, f'ID {gid}')
+            orphan = False
         else:
+            # True orphan (child with no parent and not recognized as a parent itself)
             gid = -int(cid) if pd.notna(cid) else int(-1e9 - len(rows))
-            gtitle = f'[Orphan] {ctitle}'; orphan=True
-        rows.append({'gid':gid,'gtitle':gtitle,'orphan':orphan,'cid':int(cid) if pd.notna(cid) else None,'ctitle':ctitle,'sdt':sdt,'edt':edt})
+            gtitle = f'[Orphan] {ctitle}'
+            orphan = True
+
+        rows.append({
+            'gid': gid,
+            'gtitle': gtitle,
+            'orphan': orphan,
+            'cid': int(cid) if pd.notna(cid) else None,
+            'ctitle': ctitle,
+            'sdt': sdt,
+            'edt': edt
+        })
 
     seg_df = pd.DataFrame(rows)
     if seg_df.empty:
-        raise RuntimeError('No segments to plot based on available Start/End')
+        raise RuntimeError('No segments to plot based on available Start/End after filtering')
 
-    min_date = seg_df['sdt'].min(); max_date = seg_df['edt'].max()
-    order_df = seg_df.groupby(['gid','gtitle'])['sdt'].min().reset_index().sort_values('sdt')
-    order = list(order_df[['gid','gtitle']].itertuples(index=False, name=None))
-    ypos = {gid:i for i,(gid,_) in enumerate(order)}
+    # Compute min/max for x-axis
+    min_date = seg_df['sdt'].min()
+    max_date = seg_df['edt'].max()
 
-        # --- Render chart: daily axis with above-the-bar captions & leader lines ---
-    # --- Render chart: captions stacked (no overlap) above bars with leader lines ---
+    # Group order (earliest start first)
+    order_df = seg_df.groupby(['gid', 'gtitle'])['sdt'].min().reset_index().sort_values('sdt')
+    order = list(order_df[['gid', 'gtitle']].itertuples(index=False, name=None))
+    ypos = {gid: i for i, (gid, _) in enumerate(order)}
+
+    # --- Render chart: daily axis with above-the-bar captions & leader lines ---
     import math
-
     range_days = (max_date - min_date).days + 1
 
     # Sizing and styling knobs
     dpi = 110
-    fig_w = max(24, range_days / 3.0)  # stretches with range; you've already raised MAX_IMAGE_PIXELS
+    fig_w = max(24, range_days / 3.0)  # stretches with range
     BAR_H = 0.68
-    LABEL_GAP = 0.20       # gap from bar top to the first caption
-    LEVEL_STEP = 0.36      # vertical distance between caption levels
-    TOP_PAD = 0.10         # extra padding above highest caption per parent row
+    LABEL_GAP = 0.20   # gap from bar top to the first caption
+    LEVEL_STEP = 0.36  # vertical distance between caption levels
+    TOP_PAD = 0.10     # extra padding above highest caption per parent row
     ROW_BOTTOM_GAP = 0.35  # gap below the bar before next parent row
-
-    # Compute group order (earliest start first), same as earlier logic
-    order_df = seg_df.groupby(['gid','gtitle'])['sdt'].min().reset_index().sort_values('sdt')
-    order = list(order_df[['gid','gtitle']].itertuples(index=False, name=None))
 
     # Precompute x positions for bars and caption centers
     xs_left = []
@@ -156,15 +226,16 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
         w = (s['edt'] - s['sdt']).days + 1
         xs_left.append(x0)
         widths_days.append(w)
-        xs_center.append(x0 + w/2.0)
+        xs_center.append(x0 + w / 2.0)
         idxs.append(idx)
     seg_df['x0'] = xs_left
     seg_df['w_days'] = widths_days
     seg_df['xc'] = xs_center
 
     # 1) Measurement pass: measure caption widths in pixels with a tiny temporary plot
-    #    This lets us avoid caption "smushing" because we stack based on true text width.
+    #    (lets us stack labels per parent row without overlap)
     fig_m, ax_m = plt.subplots(figsize=(fig_w, 2.0), dpi=dpi)
+
     # Use the same x-limits as final plot (padding by 1 day on each side)
     xlim_left = mdates.date2num(min_date - timedelta(days=1))
     xlim_right = mdates.date2num(max_date + timedelta(days=1))
@@ -184,7 +255,6 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     plt.close(fig_m)
 
     # Convert pixel widths to "days" on the x-axis
-    # px_per_day = (dpi * fig_w) / total_days_shown; total_days_shown = range_days + 2 (for 1-day padding each side)
     total_days_shown = (xlim_right - xlim_left)
     px_per_day = (dpi * fig_w) / max(total_days_shown, 1e-6)  # avoid divide-by-zero
     seg_df['label_w_days'] = [width_px_map[i] / max(px_per_day, 1e-6) for i in seg_df.index]
@@ -194,7 +264,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     max_level_by_gid = {}
     EPS_DAYS = 0.0  # tolerance; 0 means touching is OK
 
-    for (gid, gtitle), grp in seg_df.groupby(['gid','gtitle'], sort=False):
+    for (gid, gtitle), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
         # Build label intervals [left, right] in days for this parent's labels
         items = []
         for idx, s in grp.iterrows():
@@ -240,26 +310,25 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
     # 4) Draw the real chart
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
-
     colors = {}
-    for (gid, gtitle), grp in seg_df.groupby(['gid','gtitle'], sort=False):
+    for (gid, gtitle), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
         y0 = y_center[gid]
         col = colors.setdefault(gid, plt.cm.tab20((len(colors) % 20) / 20))
         for _, s in grp.sort_values('sdt').iterrows():
             # Bar
             x0 = s['x0']
             w = s['w_days']
-            ax.broken_barh([(x0, w)], (y0 - BAR_H/2.0, BAR_H),
+            ax.broken_barh([(x0, w)], (y0 - BAR_H / 2.0, BAR_H),
                            facecolors=col, edgecolors='black', linewidth=0.6, zorder=2)
             # Caption stacked above (no horizontal overlap in same level)
             xc = s['xc']
             lvl = int(s['label_level'])
-            y_label = y0 - (BAR_H/2.0) - LABEL_GAP - lvl * LEVEL_STEP
+            y_label = y0 - (BAR_H / 2.0) - LABEL_GAP - lvl * LEVEL_STEP
             ax.text(xc, y_label, s['ctitle'],
                     ha='center', va='bottom', fontsize=8.2, color='black',
                     zorder=5, clip_on=False)
             # Leader line from caption down to bar top
-            ax.plot([xc, xc], [y0 - BAR_H/2.0, y_label],
+            ax.plot([xc, xc], [y0 - BAR_H / 2.0, y_label],
                     color=col, linewidth=0.8, alpha=0.9, zorder=4)
 
     # Y axis: ticks at each parent center
@@ -268,13 +337,13 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     ax.set_ylim(-0.3, y_cursor + 0.3)
     ax.invert_yaxis()  # earliest parent at the top
 
-    # X axis: daily labels (keep your preferred labeling)
+    # X axis: daily labels
     ax.set_xlim(xlim_left, xlim_right)
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %Y'))
     for t in ax.get_xticklabels():
-        t.set_rotation(90); t.set_fontsize(7)
-
+        t.set_rotation(90)
+        t.set_fontsize(7)
     ax.set_xlabel('Date (daily)')
     ax.set_title('Parent (single row) Gantt — Stacked Captions Above + Leader Lines (Earliest at Top)')
     ax.grid(axis='x', linestyle=':', alpha=0.35)
@@ -283,7 +352,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     fig.savefig(chart_png, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
 
-    # --- Open the ORIGINAL workbook; add outputs only ---
+    # --- Update workbook: add data & chart sheets ---
     wb = load_workbook(in_path)
 
     # Add/replace data sheet safely
@@ -291,11 +360,19 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     if data_ws in wb.sheetnames:
         wb.remove(wb[data_ws])
     wsd = wb.create_sheet(data_ws)
-    wsd.append(['RowKey','RowTitle','ChildID','ChildTitle','Start','End','DurationDays','IsOrphan'])
-    for r in seg_df.sort_values(['gid','sdt','cid']).itertuples(index=False):
-        wsd.append([int(r.gid), r.gtitle, '' if r.cid is None else int(r.cid), r.ctitle,
-                    r.sdt.strftime('%Y-%m-%d'), r.edt.strftime('%Y-%m-%d'), (r.edt-r.sdt).days+1,
-                    'Yes' if r.orphan else 'No'])
+    wsd.append(['RowKey', 'RowTitle', 'ChildID', 'ChildTitle', 'Start', 'End', 'DurationDays', 'IsOrphan'])
+
+    for r in seg_df.sort_values(['gid', 'sdt', 'cid']).itertuples(index=False):
+        wsd.append([
+            int(r.gid),
+            r.gtitle,
+            '' if r.cid is None else int(r.cid),
+            r.ctitle,
+            r.sdt.strftime('%Y-%m-%d'),
+            r.edt.strftime('%Y-%m-%d'),
+            (r.edt - r.sdt).days + 1,
+            'Yes' if r.orphan else 'No'
+        ])
 
     # Add/replace chart sheet safely
     chart_ws = 'Parent Gantt (Daily)'
