@@ -6,7 +6,6 @@ import numpy as np
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import hashlib
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font
@@ -404,21 +403,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
 
     # NEW: Pre-assign a stable color per row (so parent color can be reused on grandparent segments)
-    palette = [plt.cm.tab20(i / 20.0) for i in range(20)]
-
-    def _int_or_none(v):
-        try:
-            return int(v) if pd.notna(v) else None
-        except Exception:
-            return None
-
-    def color_for_id(any_id: int):
-        """Stable color for an integer ID across the whole chart."""
-        if any_id is None:
-            return palette[0]
-        h = hashlib.blake2b(str(int(any_id)).encode('utf-8'), digest_size=2).hexdigest()
-        idx = int(h, 16) % len(palette)
-        return palette[idx]
+    palette = plt.cm.tab20
     colors = {}
     for i, (gid, _gtitle) in enumerate(layout_order):
         colors[gid] = palette((i % 20) / 20.0)
@@ -431,27 +416,24 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
             return None
 
     # Draw rows in the enforced layout order
-    # Draw rows in the enforced layout order
     for gid, gtitle in layout_order:
         grp = seg_df[seg_df['gid'] == gid].sort_values('sdt')
         y0 = y_center[gid]
-        row_color = color_for_id(gid)
-
         for _, s in grp.iterrows():
+            # NEW: Choose segment color — if the "child" on this row is itself a parent row elsewhere
+            # and its parent is this gid, color by the child's row color (parent row color).
             cid_i = _int_or_none(s['cid'])
+            seg_color = colors[gid]
+            if cid_i is not None and id_parent_map.get(cid_i) == gid and cid_i in colors:
+                seg_color = colors[cid_i]
 
-            # If this is a grandparent row segment that represents a parent (cid),
-            # color it by the parent’s ID; otherwise use the row color.
-            if cid_i is not None and id_parent_map.get(cid_i) == gid:
-                seg_color = color_for_id(cid_i)
-            else:
-                seg_color = row_color
-
+            # Bar
             x0 = s['x0']
             w = s['w_days']
             ax.broken_barh([(x0, w)], (y0 - BAR_H / 2.0, BAR_H),
-                        facecolors=seg_color, edgecolors='black', linewidth=0.6, zorder=2)
+                           facecolors=seg_color, edgecolors='black', linewidth=0.6, zorder=2)
 
+            # Caption stacked above (no horizontal overlap in same level)
             xc = s['xc']
             lvl = int(s['label_level'])
             y_label = y0 - (BAR_H / 2.0) - LABEL_GAP - lvl * LEVEL_STEP
@@ -459,6 +441,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
                     ha='center', va='bottom', fontsize=8.2, color='black',
                     zorder=5, clip_on=False)
 
+            # Leader line from caption down to bar top (match the bar color)
             ax.plot([xc, xc], [y0 - BAR_H / 2.0, y_label],
                     color=seg_color, linewidth=0.8, alpha=0.9, zorder=4)
 
