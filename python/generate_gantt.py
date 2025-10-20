@@ -110,7 +110,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
         return None
 
     # --- Build helper maps from the full table (before filtering) ---
-    # Map ID->Title for parent group labels
+    # Map ID->Title for labels
     id_title = {}
     for _, r in df.iterrows():
         rid = pd.to_numeric(r.get('ID'), errors='coerce')
@@ -124,7 +124,15 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
         if pd.notna(rid):
             id_state[int(rid)] = str(r.get('State') or '').strip()
 
-    # Identify parent IDs (from being referenced as a Parent) and also optionally via IsParent flag
+    # NEW: Build ID -> ParentID map (for hierarchy traversal)
+    id_parent_map = {}
+    for _, r in df.iterrows():
+        rid = pd.to_numeric(r.get('ID'), errors='coerce')
+        par = pd.to_numeric(r.get('Parent'), errors='coerce')
+        if pd.notna(rid) and pd.notna(par):
+            id_parent_map[int(rid)] = int(par)
+
+    # Identify parent IDs (from being referenced as a Parent) and optionally via IsParent flag
     parent_ids = set(pd.to_numeric(df.get('Parent'), errors='coerce').dropna().astype(int).tolist())
     has_is_parent = 'IsParent' in df.columns
 
@@ -143,7 +151,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     # Which states should be treated as "closed/done" for parent filtering?
     CLOSED_STATES = {'Closed', 'Done', 'Removed', 'Resolved'}  # adjust to your process template
 
-    # --- Build segments (children bars only; skip pure parent bars) ---
+    # --- Build leaf segments (children bars only; skip pure parent bars) ---
     rows = []
     for _, row in df.iterrows():
         sdt = pick_start(row)
@@ -181,18 +189,68 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
             orphan = True
 
         rows.append({
-            'gid': gid,
-            'gtitle': gtitle,
+            'gid': gid,           # row key: parent ID (group row)
+            'gtitle': gtitle,     # row label: parent title
             'orphan': orphan,
-            'cid': int(cid) if pd.notna(cid) else None,
-            'ctitle': ctitle,
+            'cid': int(cid) if pd.notna(cid) else None,  # child ID (this task)
+            'ctitle': ctitle,     # child title (caption)
             'sdt': sdt,
             'edt': edt
         })
 
-    seg_df = pd.DataFrame(rows)
-    if seg_df.empty:
+    seg_children = pd.DataFrame(rows)
+    if seg_children.empty:
         raise RuntimeError('No segments to plot based on available Start/End after filtering')
+
+    # NEW: Compute aggregated parent spans from their children (for grandparent rows)
+    # parent_id -> [min(child.start), max(child.end)] where these children are assigned to parent_id row
+    parent_span_df = (
+        seg_children.groupby('gid')
+        .agg(sdt=('sdt', 'min'), edt=('edt', 'max'))
+        .reset_index().rename(columns={'gid': 'pid'})
+    )
+    # Attach each parent’s grandparent (if any)
+    parent_span_df['gpid'] = parent_span_df['pid'].map(id_parent_map).astype('Int64')
+
+    # Build grandparent segments: one segment per parent, drawn on the grandparent row
+    gp_rows = []
+    for r in parent_span_df.itertuples(index=False):
+        if pd.isna(r.gpid):
+            continue  # no grandparent
+        gpid = int(r.gpid)
+        pid = int(r.pid)
+        gp_rows.append({
+            'gid': gpid,                         # row key: grandparent ID
+            'gtitle': id_title.get(gpid, f'ID {gpid}'),
+            'orphan': False,
+            'cid': pid,                          # child on this row is actually the parent ID
+            'ctitle': id_title.get(pid, f'ID {pid}'),
+            'sdt': r.sdt,                        # span covers the parent's children
+            'edt': r.edt
+        })
+    seg_grandparent = pd.DataFrame(gp_rows)
+
+    # NEW: Remove direct parent rows from grandparent rows in child segments,
+    # because we replace them with aggregated spans (seg_grandparent).
+    # i.e., when a segment's child is itself a parent (pid in parent_span_df.pid)
+    # and that child's parent is this row's gid, drop it from seg_children.
+    if not seg_grandparent.empty:
+        pids_with_spans = set(parent_span_df['pid'].astype(int).tolist())
+        # Vectorized mask to keep only "true children", not parents being shown as children of their grandparent
+        cid_series = seg_children['cid'].astype('Int64')
+        parent_of_cid = cid_series.map(id_parent_map).astype('Int64')
+        mask_keep = ~(
+            cid_series.isin(pids_with_spans) &
+            (parent_of_cid == seg_children['gid'].astype('Int64'))
+        )
+        seg_children_filtered = seg_children[mask_keep].copy()
+    else:
+        seg_children_filtered = seg_children.copy()
+
+    # NEW: Final plotting segments include:
+    #  - children on parent rows (filtered)
+    #  - aggregated parent spans on grandparent rows
+    seg_df = pd.concat([seg_children_filtered, seg_grandparent], ignore_index=True)
 
     # Compute min/max for x-axis
     min_date = seg_df['sdt'].min()
@@ -200,8 +258,43 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
     # Group order (earliest start first)
     order_df = seg_df.groupby(['gid', 'gtitle'])['sdt'].min().reset_index().sort_values('sdt')
-    order = list(order_df[['gid', 'gtitle']].itertuples(index=False, name=None))
-    ypos = {gid: i for i, (gid, _) in enumerate(order)}
+    base_order = list(order_df[['gid', 'gtitle']].itertuples(index=False, name=None))
+
+    # NEW: Build an order that shows each grandparent row before its parent rows
+    # Discover which gids have parent rows beneath them
+    start_by_gid = seg_df.groupby('gid')['sdt'].min().to_dict()
+    row_gid_set = set(order_df['gid'].tolist())
+
+    # Map grandparent -> list of parent row ids (pids) that belong to it
+    from collections import defaultdict
+    children_by_gparent = defaultdict(list)
+    for pid in row_gid_set:
+        gpid = id_parent_map.get(int(pid))
+        if gpid in row_gid_set:
+            children_by_gparent[gpid].append(pid)
+    for gpid in list(children_by_gparent.keys()):
+        children_by_gparent[gpid].sort(key=lambda x: start_by_gid.get(x, datetime.max))
+
+    added = set()
+    layout_order = []
+    # iterate by earliest start to keep overall chronology
+    for gid, _gtitle in base_order:
+        if gid in added:
+            continue
+        # always push grandparent first, then its parents
+        if gid in children_by_gparent:
+            layout_order.append((gid, id_title.get(gid, f'ID {gid}')))
+            added.add(gid)
+            for pid in children_by_gparent[gid]:
+                if pid not in added:
+                    layout_order.append((pid, id_title.get(pid, f'ID {pid}')))
+                    added.add(pid)
+        else:
+            layout_order.append((gid, id_title.get(gid, f'ID {gid}')))
+            added.add(gid)
+
+    # Y positions for rows (respecting layout_order)
+    ypos = {gid: i for i, (gid, _) in enumerate(layout_order)}
 
     # --- Render chart: daily axis with above-the-bar captions & leader lines ---
     import math
@@ -232,11 +325,9 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     seg_df['w_days'] = widths_days
     seg_df['xc'] = xs_center
 
-    # 1) Measurement pass: measure caption widths in pixels with a tiny temporary plot
-    #    (lets us stack labels per parent row without overlap)
+    # 1) Measurement pass for caption widths
     fig_m, ax_m = plt.subplots(figsize=(fig_w, 2.0), dpi=dpi)
 
-    # Use the same x-limits as final plot (padding by 1 day on each side)
     xlim_left = mdates.date2num(min_date - timedelta(days=1))
     xlim_right = mdates.date2num(max_date + timedelta(days=1))
     ax_m.set_xlim(xlim_left, xlim_right)
@@ -256,16 +347,16 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
     # Convert pixel widths to "days" on the x-axis
     total_days_shown = (xlim_right - xlim_left)
-    px_per_day = (dpi * fig_w) / max(total_days_shown, 1e-6)  # avoid divide-by-zero
+    px_per_day = (dpi * fig_w) / max(total_days_shown, 1e-6)
     seg_df['label_w_days'] = [width_px_map[i] / max(px_per_day, 1e-6) for i in seg_df.index]
 
-    # 2) Assign caption levels per parent row so label boxes don't overlap horizontally
+    # 2) Assign caption levels per row so label boxes don't overlap horizontally
     seg_df['label_level'] = 0
     max_level_by_gid = {}
     EPS_DAYS = 0.0  # tolerance; 0 means touching is OK
 
-    for (gid, gtitle), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
-        # Build label intervals [left, right] in days for this parent's labels
+    for (gid, _), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
+        # Build label intervals [left, right] in days for this row's labels
         items = []
         for idx, s in grp.iterrows():
             xc = s['xc']
@@ -291,12 +382,12 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
         max_level_by_gid[gid] = len(levels_right) if levels_right else 1
 
-    # 3) Compute per-parent Y centers with extra headroom for stacked captions
+    # 3) Compute per-row Y centers with extra headroom for stacked captions
     y_center = {}
     tick_ys = []
     tick_labels = []
     y_cursor = 0.0
-    for gid, gtitle in order:
+    for gid, gtitle in layout_order:
         L = max_level_by_gid.get(gid, 1)
         top_extra = LABEL_GAP + L * LEVEL_STEP + TOP_PAD
         y0 = y_cursor + top_extra + (BAR_H / 2.0)
@@ -310,16 +401,38 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
 
     # 4) Draw the real chart
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+    # NEW: Pre-assign a stable color per row (so parent color can be reused on grandparent segments)
+    palette = plt.cm.tab20
     colors = {}
-    for (gid, gtitle), grp in seg_df.groupby(['gid', 'gtitle'], sort=False):
+    for i, (gid, _gtitle) in enumerate(layout_order):
+        colors[gid] = palette((i % 20) / 20.0)
+
+    # Helper for safe int
+    def _int_or_none(v):
+        try:
+            return int(v) if pd.notna(v) else None
+        except Exception:
+            return None
+
+    # Draw rows in the enforced layout order
+    for gid, gtitle in layout_order:
+        grp = seg_df[seg_df['gid'] == gid].sort_values('sdt')
         y0 = y_center[gid]
-        col = colors.setdefault(gid, plt.cm.tab20((len(colors) % 20) / 20))
-        for _, s in grp.sort_values('sdt').iterrows():
+        for _, s in grp.iterrows():
+            # NEW: Choose segment color — if the "child" on this row is itself a parent row elsewhere
+            # and its parent is this gid, color by the child's row color (parent row color).
+            cid_i = _int_or_none(s['cid'])
+            seg_color = colors[gid]
+            if cid_i is not None and id_parent_map.get(cid_i) == gid and cid_i in colors:
+                seg_color = colors[cid_i]
+
             # Bar
             x0 = s['x0']
             w = s['w_days']
             ax.broken_barh([(x0, w)], (y0 - BAR_H / 2.0, BAR_H),
-                           facecolors=col, edgecolors='black', linewidth=0.6, zorder=2)
+                           facecolors=seg_color, edgecolors='black', linewidth=0.6, zorder=2)
+
             # Caption stacked above (no horizontal overlap in same level)
             xc = s['xc']
             lvl = int(s['label_level'])
@@ -327,15 +440,16 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
             ax.text(xc, y_label, s['ctitle'],
                     ha='center', va='bottom', fontsize=8.2, color='black',
                     zorder=5, clip_on=False)
-            # Leader line from caption down to bar top
-            ax.plot([xc, xc], [y0 - BAR_H / 2.0, y_label],
-                    color=col, linewidth=0.8, alpha=0.9, zorder=4)
 
-    # Y axis: ticks at each parent center
+            # Leader line from caption down to bar top (match the bar color)
+            ax.plot([xc, xc], [y0 - BAR_H / 2.0, y_label],
+                    color=seg_color, linewidth=0.8, alpha=0.9, zorder=4)
+
+    # Y axis: ticks at each row center
     ax.set_yticks(tick_ys)
     ax.set_yticklabels(tick_labels)
     ax.set_ylim(-0.3, y_cursor + 0.3)
-    ax.invert_yaxis()  # earliest parent at the top
+    ax.invert_yaxis()  # earliest at the top
 
     # X axis: daily labels
     ax.set_xlim(xlim_left, xlim_right)
@@ -345,7 +459,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
         t.set_rotation(90)
         t.set_fontsize(7)
     ax.set_xlabel('Date (daily)')
-    ax.set_title('Parent (single row) Gantt — Stacked Captions Above + Leader Lines (Earliest at Top)')
+    ax.set_title('Parent + Grandparent Gantt — Parent-colored Grandparent Spans (Earliest at Top)')
     ax.grid(axis='x', linestyle=':', alpha=0.35)
 
     plt.tight_layout()
@@ -379,7 +493,7 @@ def run_gantt(in_path: str, out_path: str, chart_png: str):
     if chart_ws in wb.sheetnames:
         wb.remove(wb[chart_ws])
     wsc = wb.create_sheet(chart_ws)
-    wsc['A1'] = 'Parent Gantt — Daily Axis with Top Labels (Earliest at Top)'
+    wsc['A1'] = 'Parent + Grandparent Gantt — Daily Axis with Top Labels (Earliest at Top)'
     wsc['A1'].font = Font(size=14, bold=True)
     img = XLImage(chart_png)
     img.anchor = 'A3'
